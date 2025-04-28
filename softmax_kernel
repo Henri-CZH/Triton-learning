@@ -1,0 +1,74 @@
+import torch
+import triton
+import triton.language as tl
+
+# define softmax kernel, one block process two row data
+@triton.jit
+def softmax_kernel(input_ptr, input_row_stride, output_ptr, output_row_stride, num_row, num_col, BLOCK_SIZE, row_per_block; tl.constexpr):
+    # define row start id
+    row_start = tl.program_id(0) * row_per_block
+    if row_start >= num_row:
+        return
+    
+    for row_idx in tl.range(row_start, row_start + row_per_block, 1):
+        # get row start ptr
+        row_start_ptr = input_ptr + row_idx * input_row_stride
+
+        # get col start ptr
+        col_offset = tl.range(0, BLOCK_SIZE)
+        input_row_ptrs = row_start_ptr + col_offset
+
+        # get mask
+        mask = col_offset < num_col
+
+        # load data in SRAM
+        data = tl.load(input_row_ptrs, mask=mask, other=-float('inf'))
+
+        # compute max value within a row
+        data_minus_max = data - tl.max(data, axis=0)
+
+        # compute numerator
+        numerator = tl.exp(data_minus_max)
+
+        # compute denominator
+        denominator = tl.sum(numerator, axis=0)
+
+        # computer num/den
+        softmax_output = numerator / denominator
+
+        # store result into DRAM
+        output_row_start_ptr = output_ptr + row_idx * output_row_stride
+        output_ptrs = output_row_start_ptr + col_offset
+        tl.store(output_ptrs, softmax_output, mask=mask)
+
+
+
+# define input tensor (1000,512)
+input_tensor = torch.rand(1000, 512, device='cuda')
+
+# define output tensor (1000, 512)
+output_tensor = torch.empty_like(input_tensor)
+
+num_row, num_col = input_tensor.shape
+BLOCK_SIZE = triton.next_power_of_2(num_col)
+num_stages = 3
+row_per_block = 2
+
+# define grid size, (num_rows + 2 - 1) / 2
+grid = lambda meta: (triton.cdiv(num_col, row_per_block),)
+
+# call kernel
+softmax_kernel[grid](
+    input_tensor, 
+    input_tensor.stride(0),
+    output_tensor,
+    output_tensor.stride(0),
+    num_row,
+    num_col,
+    BLOCK_SIZE,
+    row_per_block,
+)
+
+# evaluation result
+expected_output = torch.softmax(input_tensor, dim=1)
+printf("triton softmax match pytorch softmax:", torch.allclose(output_tensor, expected_output, atol=1e-6))
