@@ -3,6 +3,7 @@ import torch.nn as nn
 import math
 import torch.nn.functional as F
 from typing import Optional, Tuple
+from torchview import draw_graph
 
 
 class LlamaConfig():
@@ -16,6 +17,8 @@ class LlamaConfig():
             ffn_dim=11008, # FFN layer dim
             rms_norm_eps=1e-6,
     ):
+        assert hidden_dim % num_heads == 0
+        assert num_heads % num_kv_heads == 0
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
         self.num_hidden_layers = num_hidden_layers
@@ -23,13 +26,14 @@ class LlamaConfig():
         self.num_kv_heads = num_kv_heads
         self.ffn_dim = ffn_dim
         self.rms_norm_eps = rms_norm_eps
+        self.head_dim = hidden_dim // num_heads
 
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.hidden_dim = config.hidden_dim
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.hidden_dim, 2).float() / self.hidden_dim)) # (hidden_dim/2, )
+        self.head_dim = config.head_dim
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)) # (head_dim/2, )
         self.register_buffer("inv_freq", inv_freq)
 
 
@@ -39,9 +43,9 @@ class RotaryEmbedding(nn.Module):
         device -         
         """        
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq) # (seq_len, )
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq) # (seq_len, hidden_dim/2)
-        emb = torch.cat((freqs, freqs), dim=-1) # (seq_len, hidden_dim)
-        return emb.sin(), emb.cos() # (seq_len, hidden_dim)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq) # (seq_len, head_dim/2)
+        emb = torch.cat((freqs, freqs), dim=-1) # (seq_len, head_dim)
+        return emb.sin(), emb.cos() # (seq_len, head_dim)
 
 
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -91,8 +95,8 @@ class GroupQueryAttention(nn.Module):
 
         batch_size, seq_len, _  = hidden_states.shape
         q = self.wq(hidden_states) # (batch_size, seq_len, hidden_dim)
-        k = self.wk(hidden_states) # (batch_size, seq_len, num_kv_heads * hidden_dim)
-        v = self.wv(hidden_states) # (batch_size, seq_len, num_kv_heads * hidden_dim)
+        k = self.wk(hidden_states) # (batch_size, seq_len, num_kv_heads * head_dim)
+        v = self.wv(hidden_states) # (batch_size, seq_len, num_kv_heads * head_dim)
 
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)    # (batch_size, seq_len, num_heads, hidden_dim)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim) # (batch_size, seq_len, num_kv_heads, head_dim)
@@ -104,27 +108,29 @@ class GroupQueryAttention(nn.Module):
             sin = sin[position_ids].unsqueeze(1) # [batch_size, seq_len, 1, head_dim]
             cos = cos[position_ids].unsqueeze(1) # [batch_size, seq_len, 1, head_dim]
         else:
-            sin = sin.unsqueeze(1).unsqueeze(1)  # [1, seq_len, 1, head_dim]
-            cos = cos.unsqueeze(1).unsqueeze(1)  # [1, seq_len, 1, head_dim]     
+            sin = sin.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, head_dim]
+            cos = cos.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, head_dim]     
         
         q, k = apply_rotary_pos_emb(q, k, sin, cos)
 
         # GQA
-        k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2) # (batch_size, seq_len, num_heads, head_dim)
-        v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2) # (batch_size, seq_len, num_heads, head_dim)
-
-        attn = (q @ k.transpose(2, 3)) * self.scale # (batch_size, num_heads, seq_len, seq_len)
+        k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2) # (B, S, H, HD)
+        v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2) # (B, S, H, HD)
+        k = k.permute(0, 2, 3, 1) # (B, S, H, HD)->(B, H, HD, S)
+        v = v.permute(0, 2, 1, 3) # (B, S, H, HD)->(B, H, S, HD)
+        q = q.transpose(1, 2) # (B, S, H, HD)->(B, H, S, HD)
+        attn = (q @ k) * self.scale # (B, H, S, HD)@(B, H, HD, S)->(B, H, S, S)
         if attn_mask is not None:
             attn = attn + attn_mask
         else:
-            attn_mask = torch.full((1, 1, hidden_states.shape[1], hidden_states.shape[1]), float("-float"), device=hidden_states.device) # [1, 1, seq_len, seq_len]
-            attn_mask = torch(attn_mask, diagnoal=1)
+            attn_mask = torch.full((1, 1, hidden_states.shape[1], hidden_states.shape[1]), float("-inf"), device=hidden_states.device) # [1, 1, S, S]
+            attn_mask = torch.triu(attn_mask, diagonal=1)
             attn = attn + attn_mask
 
         attn = F.softmax(attn, dim=-1)
-        output = (attn @ v)  #(batch_size, num_heads, seq_len, head_dim)
-        output = output.transpose(1, 2) #(batch_size, seq_len, num_heads, head_dim)
-        output = output.reshape(batch_size, seq_len, -1) #(batch_size, seq_len, hidden_dim)
+        output = (attn @ v)  #(B, H, S, S)@(B, H, S, HD)->(B, H, S, HD)
+        output = output.transpose(1, 2) #(B, H, S, HD)->(B, S, H, HD)
+        output = output.reshape(batch_size, seq_len, -1) #(B, S, H, HD)->(B, S, D)
 
         return self.wo(output) #(batch_size, seq_len, hidden_dim)
 
@@ -221,7 +227,11 @@ if __name__ == "__main__":
     model = LlamaModel(config).to("cuda")
 
     # 模拟输入
-    input_ids = torch.randint(0, 32000, (1, 128), device="cuda") # [batch_size, seq_len]
+    input_ids = torch.randint(0, 32000, (1, 16), device="cuda") # [batch_size, seq_len]
     output = model(input_ids)
     print(f"输出形状: {output.shape}")  # [batch_size, seq_len, vocab_size]
+
+    model_graph = draw_graph(model, input_ids)
+    model_graph.resize_graph(scale=5)
+    model_graph.visual_graph.render(format='png',filename="llama2_model")
     
