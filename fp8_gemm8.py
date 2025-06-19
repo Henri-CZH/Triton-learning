@@ -5,26 +5,26 @@ import triton
 import triton.language as tl
 from triton import Config
 
-
+# grid(B*S*D//block_size, 1, 1)
 @triton.jit
 def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     """
     Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
 
     Args:
-        x_ptr (triton.Pointer): Pointer to the input tensor.
-        y_ptr (triton.Pointer): Pointer to the output tensor where quantized values will be stored.
-        s_ptr (triton.Pointer): Pointer to the output tensor where scaling factors will be stored.
+        x_ptr (triton.Pointer): Pointer to the input tensor. (B,S,D)
+        y_ptr (triton.Pointer): Pointer to the output tensor where quantized values will be stored. (B,S,D)
+        s_ptr (triton.Pointer): Pointer to the output tensor where scaling factors will be stored. (B,S,D//block_size)
         BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
 
     Returns:
         None
     """
-    pid = tl.program_id(axis=0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    pid = tl.program_id(axis=0) # tid
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE) # 总offset
     x = tl.load(x_ptr + offs).to(tl.float32)
     s = tl.max(tl.abs(x)) / 448.
-    y = x / s
+    y = x / s # quant
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y)
     tl.store(s_ptr + pid, s)
@@ -35,7 +35,7 @@ def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, tor
     Quantizes the input tensor `x` using block-wise quantization.
 
     Args:
-        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
+        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`. (B,S,D)
         block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
 
     Returns:
@@ -45,22 +45,22 @@ def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, tor
     """
     assert x.is_contiguous(), 'Input tensor must be contiguous'
     assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
-    grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn) # (B,S,D)
+    s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32) # (B,S,D//block_size)
+    grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), ) # grid(B*S*D//block_size, 1, 1)
     act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
     return y, s
 
-
+# grid(Tr, Tc)
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     """
     Dequantizes weights using the provided scaling factors and stores the result.
 
     Args:
-        x_ptr (tl.pointer): Pointer to the quantized weights.
-        s_ptr (tl.pointer): Pointer to the scaling factors.
-        y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
+        x_ptr (tl.pointer): Pointer to the quantized weights. (M,N)
+        s_ptr (tl.pointer): Pointer to the scaling factors. (M,N)
+        y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights. (M,N)
         M (int): Number of rows in the weight matrix.
         N (int): Number of columns in the weight matrix.
         BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
@@ -68,15 +68,15 @@ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     Returns:
         None
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    n = tl.cdiv(N, BLOCK_SIZE)
-    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    offs = offs_m[:, None] * N + offs_n[None, :]
+    pid_m = tl.program_id(axis=0) # Tr id
+    pid_n = tl.program_id(axis=1) # Tc id
+    n = tl.cdiv(N, BLOCK_SIZE) # Tc
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE) # Tr_th + 0~Br
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE) # Tc_th + 0~Bc
+    offs = offs_m[:, None] * N + offs_n[None, :] # [Tr_th*N:Tr_th*N + Br, Tc_th:Tc_th + Bc]
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
-    s = tl.load(s_ptr + pid_m * n + pid_n)
+    s = tl.load(s_ptr + pid_m * n + pid_n) # 为(Br,Bc)块分配一个缩放因子
     y = x * s
     tl.store(y_ptr + offs, y, mask=mask)
 
@@ -110,6 +110,7 @@ fp8_gemm_configs = [
     for block_m in [16, 32, 64] for block_n in [32, 64, 128] for num_stages in [3, 4, 5, 6]
 ]
 
+# grid(Tr, Tc), 每个线程block处理(Br,K)@(K,Bc)的计算
 @triton.autotune(configs=fp8_gemm_configs, key=['N', 'K'])
 @triton.jit
 def fp8_gemm_kernel(a_ptr, b_ptr, c_ptr,
@@ -137,17 +138,16 @@ def fp8_gemm_kernel(a_ptr, b_ptr, c_ptr,
     Returns:
         None
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    k = tl.cdiv(K, BLOCK_SIZE_K)
-    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
-    # col major->generate matrix (block_size_K, block_size_N)
-    b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None]
-    a_s_ptrs = a_s_ptr + offs_m * k
-    b_s_ptrs = b_s_ptr + (offs_n // BLOCK_SIZE_K) * k
+    pid_m = tl.program_id(axis=0) # Tr_th
+    pid_n = tl.program_id(axis=1) # Tc_th
+    k = tl.cdiv(K, BLOCK_SIZE_K) # Tk_th
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M # Tr_th + 0~Br
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N # Tc_th + 0~Bc
+    offs_k = tl.arange(0, BLOCK_SIZE_K) # 0~Bk
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :] # [Br, Bk]
+    b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None] # [Bk, Bc]
+    a_s_ptrs = a_s_ptr + offs_m * k # 为矩阵A的每一行分配独立的缩放因子，每个行缩放因子需要重复使用k次
+    b_s_ptrs = b_s_ptr + (offs_n // BLOCK_SIZE_K) * k # 为矩阵B每BLOCK_SIZE_K列 分配缩放因子，每个列分块缩放因子需要重复使用k次
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for i in range(k):
@@ -161,9 +161,9 @@ def fp8_gemm_kernel(a_ptr, b_ptr, c_ptr,
         a_s_ptrs += 1
         b_s_ptrs += 1
     c = accumulator.to(c_ptr.dtype.element_ty)
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M) # Tr_th + 0~Br
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) # Tc_th + 0~Bc
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :] # [Br, Bc]
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, c, mask=mask)
 
